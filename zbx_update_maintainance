@@ -1,0 +1,796 @@
+#!/bin/bash
+
+
+REQUIREMENTS="ldapsearch jq curl awk"
+for req in ${REQUIREMENTS} ; do 
+    type ${req} >/dev/null 2>&1 || { echo "${req} is required, but not installed  Aborting."; exit 1; }
+done
+
+bold=$(tput bold)
+normal=$(tput sgr0)
+
+VERBOSITY=0
+TESTING=false
+SKIP_GROUP_UPDATE=false
+SKIP_DEFAULTGROUP_UPDATE=false
+SKIP_MAINT_UPDATE=false
+DRY_RUN=false
+
+CONFIG=/etc/zabbix/zbx_script.conf
+USERCONFIG=~/.zbx_script.conf
+if [ -f ${CONFIG} ] ; then source ${CONFIG}; fi
+if [ -f ${USERCONFIG} ] ; then source ${USERCONFIG}; fi
+
+function print_help {
+    echo "Zabbix LDAP host group and maintainance window sync script"
+    echo
+    echo "Usage: ${0##*/} [OPTIONS]..."
+    echo
+    echo "Global options:"
+    echo -e "  -c, --conf\t\t\t path to config file"
+    echo -e "  -v, --verbosity\t\t Set verbosity level"
+    echo -e "  -i, --host-ignore-list-file\t A file containing hostnames to skip in zabbix (don't check existance, and produce no warning)"
+    echo -e "  -l, --ldap-hostgroup-prefix\t Prefix of all Hostgroups (used as LDAP filter)"
+    echo
+    echo -e "  -z, --zabbix-url\t\t URL to zabbix server Web frontende (eg. ${zbx_url})"
+    echo -e "  -u, --zabbix-username\t\t Zabbix API enabled username (NEEDS TO BE A SUPERADMIN)"
+    echo -e "  -p, --zabbix-password\t\t Zabbix API user password"
+    echo
+    echo -e "  -d, --ldap-bind-dn\t\t LDAP bind DN"
+    echo -e "  -w, --ldap-bind-pw\t\t LDAP bind password"
+    echo -e "  -b, --ldap-base-dn\t\t LDAP base DN"
+    echo
+    echo -e "  -n, --dry-run\t\t\t don't perform the actual update commands in Zabbix"
+    echo -e "  --single-group GROUP_NAME\t only execute for a single given group"
+    echo -e "  --skip-group-update\t\t skip the execution of the LDAP group sync block"
+    echo -e "  --skip-default-group-update\t\t skip the execution of the DEFAULT Maintainance group block"
+    echo -e "  --skip-maintainance-update\t skip the execution of the maintainance periode sync"
+
+    exit
+}
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]
+do
+key="$1"
+
+case $key in
+    -c|--conf)
+    CONFIG=$2
+    if [ -f ${CONFIG} ] ; then source ${CONFIG}
+    else echo "unable to read ${CONFIG}"; exit 1 ; fi
+    shift # past argument
+    ;;
+    -v|--verbosity)
+    VERBOSITY="1"
+    shift # past argument
+    ;;
+    -v2|-vv)
+    VERBOSITY="2"
+    shift # past argument
+    ;;
+    -v3|-vvv)
+    VERBOSITY="3"
+    shift # past argument
+    ;;
+    -v4|-vvvv)
+    VERBOSITY="4"
+    shift # past argument
+    ;;
+    -v5|-vvvvv)
+    VERBOSITY="5"
+    shift # past argument
+    ;;
+    -i|--host-ignore-list-file)
+    host_ignore_list="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -n|--dry-run)
+    DRY_RUN=true
+    shift # past argument
+    ;;
+    -z|--zabbix-url)
+    zbx_url="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -u|--zabbix-username)
+    zbx_username="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -p|--zabbix-password)
+    zbx_password="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -d|--ldap-bind-dn)
+    LDAP_BIND_DN="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -w|--ldap-bind-pw)
+    LDAP_BIND_PWD="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -b|--ldap-base-dn)
+    LDAP_BASE_DN="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -h|--help)
+    print_help
+    exit
+    ;;
+    -l|--ldap-hostgroup-prefix)
+    ldap_hostgroup_prefix="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    --skip-group-update)
+    SKIP_GROUP_UPDATE=true
+    shift # past argument
+    ;;
+    --skip-default-group-update)
+    SKIP_DEFAULTGROUP_UPDATE=true
+    shift
+    ;;
+    --skip-maintainance-update)
+    SKIP_MAINT_UPDATE=true
+    shift # past argument
+    ;;
+    --single-group)
+    SINGLE_GROUP=$2
+    SKIP_MAINT_UPDATE=true
+    shift
+    shift
+    ;;
+    *)    # unknown option
+    POSITIONAL+=("$1") # save it in an array for later
+    shift # past argument
+    ;;
+esac
+done
+set -- "${POSITIONAL[@]}" # restore positional parameters
+
+if [ -z ${zbx_username} ] ; then echo "Zabbix username missing"; exit 1 ; fi
+if [ -z ${zbx_password} ] ; then echo "Zabbix password missing"; exit 1 ; fi
+if [ -z ${zbx_url} ] ; then      echo "Zabbix URL missing"; exit 1 ; fi
+
+if [ -z ${group_re} ] ; then     echo "LDAP group filter regex missing"; exit 1 ; fi
+if [ -z ${ldap_hostgroup_prefix} ] ; then echo "LDAP host group prefix missing"; exit 1 ; fi
+if [ -z ${domain} ] ; then echo "Default domain missing"; exit 1 ; fi
+if [ -z ${LDAP_URI} ] ; then      echo "LDAP URL missing"; exit 1 ; fi
+if [ -z ${LDAP_BASE_DN} ] ; then  echo "LDAP base DN missing"; exit 1 ; fi
+if [ -z ${LDAP_BIND_DN} ] ; then  echo "LDAP bind DN missing"; exit 1 ; fi
+if [ -z ${LDAP_BIND_PWD} ] ; then echo "LDAP bind password missing"; exit 1 ; fi
+
+if [ "${SKIP_GROUP_UPDATE}" = true ] && [ "${SKIP_MAINT_UPDATE}" = true ] && [ "${SKIP_DEFAULTGROUP_UPDATE}" = true ] ; then 
+    echo "This is ridiculous...";
+    exit
+fi
+
+LDAPSEARCH_ARGS="-o ldif-wrap=no -H ${LDAP_URI} -b ${LDAP_BASE_DN} -D ${LDAP_BIND_DN} -w ${LDAP_BIND_PWD}"
+
+if [ ! -f $host_ignore_list ] ; then touch $host_ignore_list ; fi
+
+#------------LOGIN------------
+json_login='{
+    "jsonrpc": "2.0",
+    "method": "user.login",
+    "params": {
+        "user": "'$zbx_username'",
+        "password": "'$zbx_password'"
+    },
+    "id": 1,
+    "auth": null
+}'
+if [ $VERBOSITY -ge 1 ]; then echo "Autheticating as $zbx_username on $zbx_url"; fi
+auth_token=$(curl --silent -H "Content-Type: application/json-rpc" --data "$json_login" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq ".result" | tr -d "\"")
+#------------LOGIN------------
+
+function zbx_logout {
+    json_logout='{
+    "jsonrpc": "2.0",
+    "method": "user.logout",
+    "params": [],
+    "id": 1,
+    "auth": "'$auth_token'"
+}'
+    echo "logout -> ${bold}"$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_logout}" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result')"${normal}"
+    exit 1
+}
+
+function trapabort {
+    zbx_logout
+}
+
+trap trapabort SIGINT
+
+#------------------------Zabbix Host Groups-----------------------------
+
+if [ ! -z ${SINGLE_GROUP} ]; then
+    ldap_hostgroup_prefix=${SINGLE_GROUP}
+fi
+
+if [ $VERBOSITY -ge 1 ]; then echo "Gathering ldap host groups that match ${bold}\"$ldap_hostgroup_prefix\"${normal}"; fi
+ldap_groups=$(ldapsearch ${LDAPSEARCH_ARGS} "cn=$ldap_hostgroup_prefix*" cn 2>/dev/null| awk '/^cn\:/ {print $2}' | sort)
+
+json_hostgroup_get='{
+    "jsonrpc": "2.0",
+    "method": "hostgroup.get",
+    "params": {
+        "output": "extend",
+	    "search": { "name" : "'"$zbx_group_prefix$ldap_hostgroup_prefix"'" }
+    },
+    "auth": "'$auth_token'",
+    "id": 1
+}'
+if [ $VERBOSITY -ge 1 ]; then echo "Gathering zabbix host groups matching ${bold}\"${zbx_group_prefix}${ldap_hostgroup_prefix}\"${normal}"; fi
+zbx_group_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_get}" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+
+if [ "${SKIP_GROUP_UPDATE}" = false ] ; then
+
+    for ldap_group in $(echo "$ldap_groups"); do
+        zbx_hostgroup_name=${zbx_group_prefix}${ldap_group}
+        zbx_group_id=$(echo "${zbx_group_list}" | jq '.result[] | select(.name=="'"${zbx_hostgroup_name}"'") | .groupid')
+        if [ -z $zbx_group_id ] ; then
+            json_hostgroup_create='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.create",
+        "params": {
+            "name": "'"${zbx_hostgroup_name}"'"
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+            zbx_group_id=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_create}" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result.groupids | .[]')
+            if [ $VERBOSITY -ge 1 ]; then echo "Created zabbix host group ${zbx_hostgroup_name} with id $zbx_group_id"; fi
+        fi
+
+        json_hostgroup_members_get='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.get",
+        "params": {
+            "output": ["groupid","name"],
+            "selectHosts": [ "host","hostid","name" ],
+            "filter": {
+                "groupid": '"${zbx_group_id}"'
+            }
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+
+        zbx_host_group_members=$(curl --silent -H "Content-Type: application/json-rpc" --data "$json_hostgroup_members_get" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result[] | .hosts[] | .host' | tr -d "\"" | sort | uniq)
+        json_hostgroup_add='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.massadd",
+        "params": {
+            "groups": [
+                {
+                    "groupid": '${zbx_group_id}'
+                }
+            ],
+            "hosts": [ ]
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+
+        if [ $VERBOSITY -ge 2 ]; then echo "-> Comparing LDAP members of ${bold}${ldap_group}${normal} against Zabbix host group ${bold}${zbx_hostgroup_name}${normal} (ID ${zbx_group_id})"; fi
+        for ldap_member in $(ldapsearch ${LDAPSEARCH_ARGS} "cn=$ldap_group" member 2>/dev/null | awk '/^member\: / {split($2,cn,","); split(cn[1],x,"=");print x[2]}' | sort); do
+            
+            #change all output to lowercase and append ${domain} if its not present
+            ldap_member_orig=${ldap_member}
+            if [[ $ldap_member != *".${domain}" ]]; then ldap_member=${ldap_member}.${domain}; fi
+            host_in_maint_group+=("$ldap_member") #Add member to array of host in a maintainance group
+
+            FOUND=false
+            for zbx_member in $zbx_host_group_members; do
+                if [ "${ldap_member}" == "${zbx_member}" ]; then FOUND=true; break; fi
+            done
+
+            #chek again with all lower case
+            ldap_member=$(echo ${ldap_member} | tr '[:upper:]' '[:lower:]')
+            if [ "$FOUND" = false ] ; then
+                for zbx_member in ${zbx_host_group_members}; do
+                    zbx_member=$(echo ${zbx_member} | tr '[:upper:]' '[:lower:]')
+                    if [ "${ldap_member}" == "${zbx_member}" ]; then FOUND=true; break; 
+                    else 
+                        if [ $VERBOSITY -ge 4 ]; then echo "   ${ldap_member} != ${zbx_member}"; fi
+                    fi
+                done
+            fi
+
+            if [ "$FOUND" = true ] ; then
+                if [ $VERBOSITY -ge 3 ]; then echo "   ${ldap_member} is already member of ${zbx_hostgroup_name}"; fi
+            else
+                #Prepperation of adding the host
+                json_host_get='{
+        "jsonrpc": "2.0",
+        "method": "host.get",
+        "params": {
+            "output": [ "hostid", "host", "groupids" ],
+            "selectGroups": [ "groupid" ],
+            "filter": {
+                "host": [
+                    "'${ldap_member}'"
+                ]
+            }
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+                zbx_host_obj=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_host_get}" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+                zbx_host_id=$(echo "${zbx_host_obj}" | jq '.result[] | .hostid')
+                if [ -z $zbx_host_id ] ; then
+                    if [[ $ldap_member_orig != *".${domain}" ]]; then ldap_member_orig_fqdn=${ldap_member_orig}.${domain}; fi
+                    if [ $VERBOSITY -ge 3 ]; then echo "  ${ldap_member} not found in zabbix - trying with original LDAP CN ${ldap_member_orig} (${ldap_member_orig_fqdn}) "; fi
+                    json_host_get='{
+        "jsonrpc": "2.0",
+        "method": "host.get",
+        "params": {
+            "output": [ "hostid", "host", "groupids" ],
+            "selectGroups": [ "groupid" ],
+            "filter": {
+                "host": [
+                    "'${ldap_member_orig_fqdn}'"
+                ]
+            }
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+                    zbx_host_obj=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_host_get}" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+                    zbx_host_id=$(echo "${zbx_host_obj}" | jq '.result[] | .hostid')
+                fi
+                
+                if [ -z $zbx_host_id ] ; then 
+                    IGNORE_HOST=false
+                    grep -q "${ldap_member}" $host_ignore_list && IGNORE_HOST=true
+                    if [ "${IGNORE_HOST}" = false ] || [ $VERBOSITY -ge 4 ] ; then 
+                        #lastLogonTimestamp contains a timestamp in 100 microseconds from 1. Jan. 1600 00:00:00
+                        #131420804017328471 represents Freitag, 16. Juni 2017 11:53:21
+                        #old_ldap_member=$(ldapsearch ${LDAPSEARCH_ARGS} "(&(cn=$ldap_member)(lastLogonTimestamp<=131420804017328471))" cn 2>/dev/null | awk '/^cn\: / {print tolower($2)}')
+                        #if [ ! -z $old_ldap_member ] ; then  
+                            echo " ? Host ${bold}${ldap_member}${normal} does ${bold}NOT exist${normal} in Zabbix!"
+                        #fi
+                    fi
+                    continue
+                fi
+                json_hostgroup_add=$(echo ${json_hostgroup_add} | jq ' .params.hosts += [{"hostid":'${zbx_host_id}'}]')
+                echo " + ${bold}adding${normal} ${ldap_member} (Zabbix ID: ${zbx_host_id}) to ${zbx_hostgroup_name}"
+            fi
+        done
+
+        new_zbx_group_member_count=$(echo $json_hostgroup_add | jq '.params.hosts | length')
+        if [ $new_zbx_group_member_count -gt 0 ]; then 
+            echo "Applying ${new_zbx_group_member_count} added host(s)..."
+            if [ "${DRY_RUN}" = false ] ; then curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_add}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php | jq ' .result.groupids[]'
+            else echo "  dry run - won't execute"; fi
+        fi
+
+        #Now search for Hosts that DON'T belonginto that group
+        json_hostgroup_remove='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.massremove",
+        "params": {
+            "groupids": [
+                '$zbx_group_id'
+            ],
+            "hostids": [ ]
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+        if [ $VERBOSITY -ge 2 ]; then echo "  Removing old/wrong host group entries from ${bold}${zbx_hostgroup_name}${normal}"; fi
+        json_zbx_hostgroup_members=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_members_get}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+        zbx_host_group_members=$(echo "${json_zbx_hostgroup_members}" | jq '.result[] | .hosts[] | .host' | tr -d "\"" | sort | uniq)
+        for zbx_member in ${zbx_host_group_members}; do
+            FOUND=false
+            for ldap_member in $(ldapsearch ${LDAPSEARCH_ARGS} "cn=$ldap_group" member 2>/dev/null | awk '/^member\: / {split($2,cn,","); split(cn[1],x,"=");print x[2]}' | sort ); do    
+                ldap_member_orig=${ldap_member}
+                if [[ $ldap_member != *".${domain}" ]]; then ldap_member=$ldap_member.${domain}; fi
+                ldap_member_lower=$(echo ${ldap_member} | tr '[:upper:]' '[:lower:]')
+                if [[ $ldap_member_orig != *".${domain}" ]]; then ldap_member_orig_fqdn=${ldap_member_orig}.${domain}; fi
+
+                if [ "$ldap_member" == "$zbx_member" ]; then FOUND=true; break; fi
+                if [ "$ldap_member_lower" == "$zbx_member" ]; then FOUND=true; break; fi
+                if [ "$ldap_member_orig" == "$zbx_member" ]; then FOUND=true; break; fi
+                if [ "$ldap_member_orig_fqdn" == "$zbx_member" ]; then FOUND=true; break; fi
+                #if [ $VERBOSITY -ge 4 ]; then echo "   ${zbx_member} did not not match any of the following strings: $ldap_member_orig $ldap_member $ldap_member_lower $ldap_member_orig_fqdn"; fi
+            done
+            if [ "$FOUND" = false ]; then
+                if [ $VERBOSITY -ge 1 ]; then echo "  - ${zbx_member} is not member of ${ldap_group} anymore -> removing"; fi
+                zbx_member_id=$(echo ${json_zbx_hostgroup_members} | jq '.result[] | .hosts[] | select(.name == "'"${zbx_member}"'") | .hostid')
+                if [ -z $zbx_member_id ]; then 
+                    echo "${bold}PROBLEM${normal} - Unable to remove ${zbx_member} - hostid not found!?"
+                else
+                    json_hostgroup_remove=$(echo ${json_hostgroup_remove} | jq '.params.hostids += ['${zbx_member_id}']')
+                fi
+            else 
+                if [ $VERBOSITY -ge 3 ]; then echo "   ${zbx_member} is a valid member of ${ldap_group}"; fi
+            fi
+        done
+        zbx_group_remove_member_count=$(echo ${json_hostgroup_remove} | jq '.params.hostids | length')
+        if [ $zbx_group_remove_member_count -gt 0 ]; then 
+            echo "Removing ${zbx_group_remove_member_count} old host(s)..."
+            if [ "${DRY_RUN}" = false ] ; then curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_remove}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php | jq ' .result.groupids[]'
+            else echo "  dry run - won't execute"; fi
+        fi
+    done
+
+    #Check for Hostgroups taht are not needed anymiore
+    zbx_group_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_get}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+
+    for zbx_group in $(echo ${zbx_group_list} | jq '.result[] | .name' | awk -F/ '{gsub("\"","",$2); print $2}' | sort); do
+        zbx_hostgroup_name=${zbx_group_prefix}${zbx_group}
+        zbx_group_id=$(echo "${zbx_group_list}" | jq '.result[] | select(.name=="'"${zbx_hostgroup_name}"'") | .groupid')
+        FOUND=false
+        
+        for ldap_group in $(echo "${ldap_groups}"); do
+            if [ "${zbx_group}" == "${ldap_group}" ]; then
+                FOUND=true
+                if [ $VERBOSITY -ge 4 ]; then echo "${zbx_group} == ${ldap_group} -> $FOUND"; fi
+                break 1
+            else 
+                if [ $VERBOSITY -ge 5 ]; then echo "${zbx_group} != ${ldap_group} -> $FOUND"; fi
+            fi
+        done
+
+        if [ "$FOUND" == "false" ]; then 
+            echo "${bold}Deleting ${zbx_hostgroup_name} (${zbx_group_id})${normal}"
+            json_hostgroup_delete='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.delete",
+        "params": [
+            '"$zbx_group_id"'
+        ],
+        "auth": "'$auth_token'",
+        "id": 1
+}'
+            
+            if [ "${DRY_RUN}" = false ] ; then curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_delete}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php | jq '.result'
+            else echo "  dry run - won't execute"; fi
+        else 
+            if [ $VERBOSITY -ge 1 ]; then echo " ${bold}${zbx_group}${normal} exists in Zabbix and LDAP - keepig it"; fi
+        fi
+    done
+fi
+
+if [ "${SKIP_DEFAULTGROUP_UPDATE}" = false ] ; then
+
+    #------------------------- DEFAULT MAINTAINANCE GROUP -----------------
+    #------------------------------------------------------------------------------------------------------------------------------------------------
+    json_hostgroup_get='{
+    "jsonrpc": "2.0",
+    "method": "hostgroup.get",
+    "params": {
+        "output": "extend",
+        "search": { "name" : "'"$zbx_group_prefix"'" }
+    },
+    "auth": "'$auth_token'",
+    "id": 1
+}'
+    zbx_default_maint_hostgroup_name="${zbx_group_prefix}${zbx_default_maint_name}"
+    if [ $VERBOSITY -ge 2 ]; then echo "-> Adding missing Hosts into default maintainance group ${bold}zbx_default_maint_hostgroup_name${normal}"; fi
+
+    zbx_group_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_get}" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+    zbx_group_id=$(echo "${zbx_group_list}" | jq '.result[] | select(.name=="'"${zbx_default_maint_hostgroup_name}"'") | .groupid')
+    if [ -z $zbx_group_id ] ; then
+        json_hostgroup_create='{
+    "jsonrpc": "2.0",
+    "method": "hostgroup.create",
+    "params": {
+        "name": "'"${zbx_default_maint_hostgroup_name}"'"
+    },
+    "auth": "'$auth_token'",
+    "id": 1
+}'
+        zbx_group_id=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_create}" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result.groupids | .[]')
+        if [ $VERBOSITY -ge 1 ]; then echo "Created zabbix host group ${zbx_default_maint_hostgroup_name} with id $zbx_group_id"; fi
+    else
+        if [ $VERBOSITY -ge 2 ]; then echo "Host group ${zbx_default_maint_hostgroup_name} already exists with id $zbx_group_id"; fi
+    fi
+
+    json_hostgroup_get='{
+    "jsonrpc": "2.0",
+    "method": "hostgroup.get",
+    "params": {
+        "output": "extend",
+    "search": { "name" : "Microsoft" }
+    },
+    "auth": "'$auth_token'",
+    "id": 1
+}'
+    zbx_group_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "$json_hostgroup_get" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+    zbx_microsoft_group_id=$(echo $zbx_group_list | jq '.result[]  | select(.name=="Microsoft") | .groupid')
+
+    json_microsoft_hostgroup_members_get='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.get",
+        "params": {
+            "output": ["groupid","name"],
+            "selectHosts": [ "host","hostid","name" ],
+            "filter": {
+                "groupid": '"${zbx_microsoft_group_id}"'
+            }
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+
+    zbx_microsoft_host_group=$(curl --silent -H "Content-Type: application/json-rpc" --data "$json_microsoft_hostgroup_members_get" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+    zbx_microsoft_host_group_members=$(echo ${zbx_microsoft_host_group} | jq '.result[] | .hosts[] | .host' | tr -d "\"" | sort | uniq)
+
+    if [ "${SKIP_GROUP_UPDATE}" = false ] ; then
+        if [ $VERBOSITY -ge 1 ]; then echo "  comparing ${#host_in_maint_group[@]} host(s) against $(echo ${zbx_microsoft_host_group_members} | wc -l) host(s) for group ${bold}${zbx_default_maint_hostgroup_name}${normal}"; fi
+
+        for host in ${zbx_microsoft_host_group_members} ; do
+            found=false
+            for maint_host in ${host_in_maint_group[@]} ; do
+                if [ "${host}" == "${maint_host}" ] ; then
+                    if [ $VERBOSITY -ge 3 ]; then echo " ~ ${maint_host} is already member of a maintainance group"; fi
+                    found=true
+                    remove_from_default_group+=($host)
+                fi
+            done
+
+            if [ "$found" == false ] ; then
+                if [ $VERBOSITY -ge 3 ]; then echo " * ${host} is NOT member of any specific maintainance group and will be put into DEFAULT group"; fi
+                default_maint_group_hosts+=($host)
+            fi
+        done
+    else 
+        if [ $VERBOSITY -ge 1 ]; then echo " ~ Skipping the addition of any hosts as there are non to compare against..."; fi
+    fi
+
+    json_hostgroup_members_get='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.get",
+        "params": {
+            "output": ["groupid","name"],
+            "selectHosts": [ "host","hostid","name" ],
+            "filter": {
+                "groupid": '"${zbx_group_id}"'
+            }
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+
+    json_hostgroup_add='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.massadd",
+        "params": {
+            "groups": [
+                {
+                    "groupid": '${zbx_group_id}'
+                }
+            ],
+            "hosts": [ ]
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+
+    zbx_host_group_members=$(curl --silent -H "Content-Type: application/json-rpc" --data "$json_hostgroup_members_get" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result[] | .hosts[] | .host' | tr -d "\"" | sort | uniq)
+
+    for default_member in ${default_maint_group_hosts[@]}; do
+        found=false
+        for host in ${zbx_host_group_members} ; do
+            if [ "${host}" == "${default_member}" ] ; then
+                if [ $VERBOSITY -ge 3 ]; then echo " ~ ${default_member} is already member of a specific maintainance group"; fi
+                found=true
+            fi
+        done
+
+        if [ "$found" == false ] ; then
+            zbx_host_id=$(echo ${zbx_microsoft_host_group} | jq '.result[] | .hosts[] | select(.host=="'"${default_member}"'") | .hostid')
+            json_hostgroup_add=$(echo ${json_hostgroup_add} | jq ' .params.hosts += [{"hostid":'${zbx_host_id}'}]')
+        fi;
+    done
+
+    new_zbx_group_member_count=$(echo $json_hostgroup_add | jq '.params.hosts | length')
+    if [ $new_zbx_group_member_count -gt 0 ]; then 
+        echo "Applying ${new_zbx_group_member_count} added host(s)..."
+        if [ "${DRY_RUN}" = false ] ; then curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_add}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php | jq ' .result.groupids[]'
+        else echo "  dry run - won't execute"; fi
+    fi
+
+    if [ $VERBOSITY -ge 1 ]; then echo "  Removing old/wrong host group entries from ${bold}${zbx_default_maint_hostgroup_name}${normal}"; fi
+    json_hostgroup_remove='{
+        "jsonrpc": "2.0",
+        "method": "hostgroup.massremove",
+        "params": {
+            "groupids": [
+                '$zbx_group_id'
+            ],
+            "hostids": [ ]
+        },
+        "auth": "'${auth_token}'",
+        "id": 1
+    }'
+
+    for host in ${zbx_host_group_members} ; do
+        for rm_host in ${remove_from_default_group[@]} ; do
+            if [ "${host}" == "${rm_host}" ] ; then
+                zbx_host_id=$(echo ${zbx_microsoft_host_group} | jq '.result[] | .hosts[] | select(.host=="'"${rm_host}"'") | .hostid')
+                json_hostgroup_remove=$(echo ${json_hostgroup_remove} | jq '.params.hostids += ['${zbx_host_id}']')
+                if [ $VERBOSITY -ge 3 ]; then echo " - ${rm_host} (ID: ${zbx_host_id}) will get removed from ${zbx_default_maint_hostgroup_name} (ID: ${zbx_group_id})"
+                elif [ $VERBOSITY -ge 2 ]; then echo " - ${rm_host} will get removed from ${zbx_default_maint_hostgroup_name}"; fi
+            fi
+        done
+    done
+
+    zbx_group_remove_member_count=$(echo ${json_hostgroup_remove} | jq '.params.hostids | length')
+    if [ $zbx_group_remove_member_count -gt 0 ]; then 
+        echo "Removing ${zbx_group_remove_member_count} old host(s)..."
+        #if [ $VERBOSITY -ge 3 ] ; then echo ${json_hostgroup_remove} | jq ; fi
+        if [ "${DRY_RUN}" = false ] ; then curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_remove}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php | jq ' .result.groupids[]'
+        else echo "  dry run - won't execute"; fi
+    fi
+fi
+
+
+#---------------------Maintainance--------------------
+if [ "${SKIP_MAINT_UPDATE}" = false ] ; then
+    json_maintainance='{
+        "jsonrpc": "2.0",
+        "method": "maintenance.get",
+        "params": {
+            "output": "extend",
+            "selectGroups": "extend",
+            "selectTimeperiods": "extend"
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+    zbx_maint_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_maintainance}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+    zbx_group_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_hostgroup_get}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+
+    time_re="([0-9][0-9])([0-9][0-9])"
+    for ldap_group in $(echo "${ldap_groups}"); do
+    	
+    	[ "${ldap_group}" == "DO_SCCM_SUP_SV_NREBOOT_NOINSTALL" ] && continue #We know that this group does not match
+
+    	if [[ $ldap_group =~ $group_re ]]; then 
+            dow=${BASH_REMATCH[1]}
+            start_time=${BASH_REMATCH[2]}
+            end_time=${BASH_REMATCH[3]}
+    		zbx_maint_name="$zbx_maint_period_prefix $dow $start_time-$end_time"
+    	else
+    		echo "${bold}$ldap_group${normal} does not match regex $group_re -> skipping"
+    		continue
+    	fi
+
+
+        zbx_hostgroup_name=$zbx_group_prefix$ldap_group
+        zbx_group_id=$(echo "$zbx_group_list" | jq '.result[] | select(.name=="'"$zbx_hostgroup_name"'") | .groupid')
+        if [ $VERBOSITY -ge 3 ]; then echo "${bold}Searching${normal} for matching maintainance periodes for host group ${bold}${zbx_hostgroup_name}${normal} (${zbx_group_id})"; fi
+
+    	zbx_maint_id=$(echo $zbx_maint_list | jq '.result[] |  select(.name == "'"$zbx_maint_name"'") | .maintenanceid' | tr -d "\"")
+    	if [ -z $zbx_maint_id ]; then 
+            if [ $VERBOSITY -ge 2 ]; then  echo " preparing creation of new maintainance periode ${bold}${zbx_maint_name}${normal}"; fi
+            # https://www.zabbix.com/documentation/3.4/manual/api/reference/maintenance/object
+            zbx_dow_bin=0           # binary representaion of day the periode comes into effect
+            # MO|DI|MI|DO|FR|SA|SO
+            #  0  0  1  0  0  0  0 = 4 (only MI)
+            #  1  0  1  0  1  0  0 = 1 + 4 + 16 = 21 (MO,MI,FR)
+            if [[ "$dow" == "MO" ]] ; then zbx_dow_bin=1
+            elif [[ "$dow" == "DI" ]] ; then zbx_dow_bin=2
+            elif [[ "$dow" == "MI" ]] ; then zbx_dow_bin=4
+            elif [[ "$dow" == "DO" ]] ; then zbx_dow_bin=8
+            elif [[ "$dow" == "FR" ]] ; then zbx_dow_bin=16
+            elif [[ "$dow" == "SA" ]] ; then zbx_dow_bin=32
+            elif [[ "$dow" == "SO" ]] ; then zbx_dow_bin=64
+            else
+                echo "ERROR - Unknown DOW $dow"
+                echo "  unable to create Zabbix Maintainance Periode $zbx_maint_name"
+                continue
+            fi
+            
+            zbx_start_time_sec=0    # in seconds startin from 00:00 o'clock
+            if [[ $start_time =~ $time_re ]] ; then 
+                #multiply the first number with 3600 (seconds of an hour) and the second one with 60 (seconds of a minute) and add them together
+                zbx_start_time_sec=$(($((${BASH_REMATCH[1]}*3600))+$((${BASH_REMATCH[2]}*60))))
+            else 
+                echo "ERROR - start time $start_time has invalid format (does not match $time_re)"
+                echo "  unable to create Zabbix Maintainance Periode $zbx_maint_name"
+                continue
+            fi
+            
+            zbx_duration_sec=0   # in seconds
+            if [[ $end_time =~ $time_re ]] ; then 
+                #multiply the first number with 3600 (seconds of an hour) and the second one with 60 (seconds of a minute) and add them together
+                zbx_duration_sec=$(($(($((${BASH_REMATCH[1]}*3600))+$((${BASH_REMATCH[2]}*60))))-$zbx_start_time_sec))
+            else 
+                echo "ERROR - end time $end_time has invalid format (does not match $time_re)"
+                echo "  unable to create Zabbix Maintainance Periode $zbx_maint_name"
+                continue
+            fi
+
+            json_maint_create='{
+        "jsonrpc": "2.0",
+        "method": "maintenance.create",
+        "params": {
+            "name": "'${zbx_maint_name}'",
+            "active_since": "1537999200",
+            "active_till": "2147382000",
+            "groupids": [
+                '${zbx_group_id}'
+            ],
+            "timeperiods": [
+                {
+                  "timeperiod_type": "3",
+                  "every": "1",
+                  "dayofweek": "'${zbx_dow_bin}'",
+                  "start_time": "'${zbx_start_time_sec}'",
+                  "period": "'${zbx_duration_sec}'",
+                  "start_date": "0"
+                }
+            ]
+        },
+        "auth": "'$auth_token'",
+        "id": 1
+    }'
+            if [ "${DRY_RUN}" = false ] ; then
+                zbx_main_creation_result=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_maint_create}" -X POST $zbx_url/zabbix/api_jsonrpc.php)
+                zbx_maint_id=$(echo ${zbx_main_creation_result} | jq ' .result.maintenanceids[]' | tr -d "\"")
+                if [ -z $zbx_maint_id ] ; then 
+                    echo "ERROR - Unable to create new  Zabbix maintainance periode ${bold}${zbx_maint_name}${normal}"
+                    echo $zbx_main_creation_result | jq
+                else
+                    echo " + Created new  Zabbix maintainance periode ${bold}${zbx_maint_name}${normal} (ID: ${zbx_maint_id})" 
+                fi
+            else
+                echo "  dry run - won't execute"
+            fi
+            zbx_maint_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_maintainance}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+    	else
+            # Maintainance periode exists, lets check each group membership
+            json_maintainance_group_append='{
+      "jsonrpc": "2.0",
+      "method": "maintenance.update",
+      "params": {
+        "maintenanceid": "'$zbx_maint_id'",
+        "groupids": [ ]
+      },
+      "auth": "'$auth_token'",
+      "id": 1
+    }'
+    		if [ $VERBOSITY -ge 3 ]; then  echo " ${bold}found${normal} matching maintainance periode ${bold}${zbx_maint_name}${normal} (${zbx_maint_id})"; fi
+
+            MISSING=true
+            for zbx_maint_member_group_id in $(echo "${zbx_maint_list}" | jq '.result[] | select(.name == "'"${zbx_maint_name}"'") | .groups[] | .groupid'); do
+                json_maintainance_group_append=$(echo "${json_maintainance_group_append}" | jq '.params.groupids += ['"$zbx_maint_member_group_id"']')
+                if [ $zbx_maint_member_group_id == $zbx_group_id ]; then MISSING=false ; fi
+            done
+
+            if [ "${MISSING}" = true ]; then 
+                echo "+ Append missing host goup ${zbx_hostgroup_name} (${zbx_group_id}) to maintainance periode ${zbx_maint_name} (${zbx_maint_id})"
+                json_maintainance_group_append=$(echo ${json_maintainance_group_append} | jq '.params.groupids += ['"$zbx_group_id"']')
+                
+                if [ $VERBOSITY -ge 1 ]; then echo " Updating ${zbx_maint_name} groups..."; fi
+                if [ "${DRY_RUN}" = false ] ; then 
+                    zbx_maint_id_result=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_maintainance_group_append}" -X POST $zbx_url/zabbix/api_jsonrpc.php | jq '.result | .maintenanceids[]' | tr -d "\"")
+                    if [ ${zbx_maint_id_result} == ${zbx_maint_id} ] ; then 
+                        if [ $VERBOSITY -ge 2 ]; then echo "  Successully updated maintainance periode ${bold}${zbx_maint_name}${normal} (${zbx_maint_id})" ; fi
+                    else
+                        echo "${bold}ERROR${normal} while trying to update hostgroup memberships of maintainance periode ${bold}${zbx_maint_name} (${zbx_maint_id})${normal}"
+                    fi
+                    zbx_maint_list=$(curl --silent -H "Content-Type: application/json-rpc" --data "${json_maintainance}" -X POST ${zbx_url}/zabbix/api_jsonrpc.php)
+                else
+                    echo "  dry run - won't execute"
+    	        fi
+            fi
+        fi
+    done
+fi
+
+
+zbx_logout
+
